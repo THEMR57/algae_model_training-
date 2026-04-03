@@ -65,10 +65,11 @@ def build_target(df: pd.DataFrame) -> Tuple[np.ndarray, str]:
 
 
 def prepare_features(df: pd.DataFrame, target_col: str) -> Tuple[np.ndarray, List[str]]:
-    feature_df = df.drop(columns=[c for c in ["target_hab_label", "target_hab_probability"] if c in df.columns], errors="ignore")
+    feature_df = df.drop(columns=[c for c in ["target_hab_label", "target_hab_probability"] if c in df.columns])
     if "system:index" in feature_df.columns:
         feature_df = feature_df.drop(columns=["system:index"])
     numeric = feature_df.apply(pd.to_numeric, errors="coerce")
+    # First fill with per-column medians; second fill handles columns that are entirely NaN.
     numeric = numeric.fillna(numeric.median(numeric_only=True)).fillna(0.0)
     cols = [c for c in numeric.columns if c != target_col]
     if not cols:
@@ -101,6 +102,13 @@ def split_data(x: np.ndarray, y: np.ndarray, train_ratio: float, val_ratio: floa
 
 
 def build_feature_adjacency(train_x: np.ndarray, top_k: int, max_rows: int = 50000, seed: int = 42) -> torch.Tensor:
+    """Build a correlation-based normalized feature graph.
+
+    Uses absolute Pearson correlation between feature columns, keeps top_k
+    strongest neighbors per feature, symmetrizes edges, adds self-loops, and
+    applies symmetric degree normalization. If row count exceeds max_rows, a
+    deterministic random sample is used for faster correlation estimation.
+    """
     if len(train_x) > max_rows:
         rng = np.random.default_rng(seed)
         sample_idx = rng.choice(len(train_x), size=max_rows, replace=False)
@@ -134,6 +142,7 @@ class GraphConv(nn.Module):
 
     def forward(self, h: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
         self_part = self.self_linear(h)
+        # i,j are feature nodes; b=batch, t=time, d=embedding dimension.
         neigh = torch.einsum("ij,btjd->btid", adj, h)
         neigh_part = self.neigh_linear(neigh)
         return self.activation(self_part + neigh_part)
@@ -298,16 +307,21 @@ def main() -> None:
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, drop_last=False)
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, drop_last=False)
 
+    effective_top_k = max(1, min(args.top_k_neighbors, x_train.shape[1] - 1))
     adj = build_feature_adjacency(
         x_train,
-        top_k=max(1, min(args.top_k_neighbors, x_train.shape[1] - 1)),
+        top_k=effective_top_k,
         seed=args.seed,
     ).to(device)
 
     model = STGNNTransformer(num_features=x_train.shape[1]).to(device)
 
-    pos_count = max(int(y_train.sum()), 1)
-    neg_count = max(int(len(y_train) - y_train.sum()), 1)
+    pos_count = int(y_train.sum())
+    neg_count = int(len(y_train) - y_train.sum())
+    if pos_count == 0 or neg_count == 0:
+        raise ValueError(
+            f"Training split must contain both classes. Got positives={pos_count}, negatives={neg_count}."
+        )
     pos_weight = torch.tensor([neg_count / pos_count], dtype=torch.float32, device=device)
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
