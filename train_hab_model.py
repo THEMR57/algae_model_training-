@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import argparse
 import json
-import math
 import os
 import random
 from dataclasses import dataclass
@@ -12,6 +11,8 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
+
+NODE_EMBED_INIT_STD = 0.02
 
 
 def set_seed(seed: int) -> None:
@@ -99,8 +100,14 @@ def split_data(x: np.ndarray, y: np.ndarray, train_ratio: float, val_ratio: floa
     )
 
 
-def build_feature_adjacency(train_x: np.ndarray, top_k: int) -> torch.Tensor:
-    corr = np.corrcoef(train_x, rowvar=False)
+def build_feature_adjacency(train_x: np.ndarray, top_k: int, max_rows: int = 50000, seed: int = 42) -> torch.Tensor:
+    if len(train_x) > max_rows:
+        rng = np.random.default_rng(seed)
+        sample_idx = rng.choice(len(train_x), size=max_rows, replace=False)
+        sample_x = train_x[sample_idx]
+    else:
+        sample_x = train_x
+    corr = np.corrcoef(sample_x, rowvar=False)
     corr = np.nan_to_num(corr, nan=0.0)
     corr = np.abs(corr)
     np.fill_diagonal(corr, 0.0)
@@ -145,7 +152,7 @@ class STGNNTransformer(nn.Module):
         super().__init__()
         self.num_features = num_features
         self.value_proj = nn.Linear(1, gnn_dim)
-        self.node_embed = nn.Parameter(torch.randn(num_features, gnn_dim) * 0.02)
+        self.node_embed = nn.Parameter(torch.randn(num_features, gnn_dim) * NODE_EMBED_INIT_STD)
         self.gnn = GraphConv(gnn_dim, transformer_dim)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=transformer_dim,
@@ -291,7 +298,11 @@ def main() -> None:
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, drop_last=False)
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, drop_last=False)
 
-    adj = build_feature_adjacency(x_train, top_k=max(1, min(args.top_k_neighbors, x_train.shape[1] - 1))).to(device)
+    adj = build_feature_adjacency(
+        x_train,
+        top_k=max(1, min(args.top_k_neighbors, x_train.shape[1] - 1)),
+        seed=args.seed,
+    ).to(device)
 
     model = STGNNTransformer(num_features=x_train.shape[1]).to(device)
 
@@ -302,7 +313,7 @@ def main() -> None:
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=3)
 
-    best_f1 = -math.inf
+    best_f1 = -1.0
     best_state = None
     history: List[Dict[str, float]] = []
 
