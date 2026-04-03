@@ -123,9 +123,6 @@ def build_feature_adjacency(train_x: np.ndarray, top_k: int, max_rows: int = 500
     if non_constant_idx.size >= 2:
         corr_non_constant = np.corrcoef(sample_x[:, non_constant], rowvar=False)
         corr[np.ix_(non_constant_idx, non_constant_idx)] = np.nan_to_num(corr_non_constant, nan=0.0)
-    elif non_constant_idx.size == 1:
-        i = int(non_constant_idx[0])
-        corr[i, i] = 1.0
     corr = np.abs(corr)
     np.fill_diagonal(corr, 0.0)
     adj = np.zeros_like(corr)
