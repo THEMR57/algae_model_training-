@@ -122,7 +122,7 @@ def build_feature_adjacency(train_x: np.ndarray, top_k: int, max_rows: int = 500
     non_constant_idx = np.flatnonzero(non_constant)
     # Need at least two non-constant features to estimate pairwise correlation.
     if non_constant_idx.size >= 2:
-        corr_non_constant = np.corrcoef(sample_x[:, non_constant], rowvar=False)
+        corr_non_constant = np.corrcoef(sample_x[:, non_constant_idx], rowvar=False)
         corr[np.ix_(non_constant_idx, non_constant_idx)] = np.nan_to_num(corr_non_constant, nan=0.0)
     corr = np.abs(corr)
     np.fill_diagonal(corr, 0.0)
