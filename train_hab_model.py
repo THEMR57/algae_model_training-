@@ -278,6 +278,8 @@ def main() -> None:
     parser.add_argument("--top-k-neighbors", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
+    # Jupyter/Colab kernels inject `-f <connection_file>`; accept it silently.
+    parser.add_argument("-f", dest="_ipykernel_connection_file", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     set_seed(args.seed)
