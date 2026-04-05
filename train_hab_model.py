@@ -149,8 +149,8 @@ def build_feature_adjacency(train_x: np.ndarray, top_k: int, max_rows: int = 500
     adj = np.maximum(adj, adj.T)
     adj += np.eye(n, dtype=np.float64)
     deg = adj.sum(axis=1)
-    inv_sqrt = np.power(deg, -0.5, where=deg > 0)
-    inv_sqrt[deg <= 0] = 0.0
+    inv_sqrt = np.zeros_like(deg)
+    np.power(deg, -0.5, where=deg > 0, out=inv_sqrt)
     norm = (inv_sqrt[:, None] * adj) * inv_sqrt[None, :]
     return torch.tensor(norm, dtype=torch.float32)
 
@@ -313,7 +313,10 @@ def collect_probs_labels(
 
 
 def build_engineered_sequence_features(features: np.ndarray, labels: np.ndarray, seq_len: int) -> Tuple[np.ndarray, np.ndarray]:
-    windows = np.lib.stride_tricks.sliding_window_view(features, window_shape=seq_len, axis=0)
+    if len(features) <= seq_len:
+        raise ValueError("Dataset too small for engineered sequence features.")
+    # Match SequenceDataset alignment: input window [i : i+seq_len) predicts label at i+seq_len.
+    windows = np.lib.stride_tricks.sliding_window_view(features[:-1], window_shape=seq_len, axis=0)
     windows = np.swapaxes(windows, 1, 2)
     mean_feat = windows.mean(axis=1)
     std_feat = windows.std(axis=1)
@@ -500,7 +503,7 @@ def main() -> None:
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    df = pd.read_csv(args.data_path)
+    df = pd.read_csv(args.data_path, low_memory=False)
     df = clean_dataframe(df)
     if "system:index" in df.columns:
         df = df.sort_values("system:index").reset_index(drop=True)
