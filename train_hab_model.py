@@ -290,17 +290,17 @@ def find_best_threshold(y_true: np.ndarray, probs: np.ndarray, objective: str = 
     if objective not in {"f1", "accuracy", "balanced_accuracy"}:
         raise ValueError(f"Unsupported threshold objective: {objective}")
     best_threshold = 0.5
-    best_f1 = -1.0
+    best_score = -1.0
     for threshold in np.linspace(0.05, 0.95, 181):
         if objective == "f1":
             score = f1_score(y_true, (probs >= threshold).astype(int), zero_division=0)
         else:
             metrics = compute_metrics_from_probs(y_true, probs, float(threshold))
             score = float(metrics[objective])
-        if score > best_f1:
-            best_f1 = float(score)
+        if score > best_score:
+            best_score = float(score)
             best_threshold = float(threshold)
-    return best_threshold, best_f1
+    return best_threshold, best_score
 
 
 def collect_probs_labels(
@@ -345,15 +345,15 @@ def optimize_ensemble(
 ) -> Tuple[float, float, float]:
     best_weight = 0.5
     best_threshold = 0.5
-    best_f1 = -1.0
+    best_score = -1.0
     for weight in np.linspace(0.0, 1.0, 41):
         probs = weight * deep_val_probs + (1.0 - weight) * tree_val_probs
-        threshold, f1 = find_best_threshold(y_val, probs, objective=objective)
-        if f1 > best_f1:
-            best_f1 = f1
+        threshold, score = find_best_threshold(y_val, probs, objective=objective)
+        if score > best_score:
+            best_score = score
             best_weight = float(weight)
             best_threshold = float(threshold)
-    return best_weight, best_threshold, best_f1
+    return best_weight, best_threshold, best_score
 
 
 def save_training_curves(history: List[Dict[str, float]], output_dir: str) -> None:
