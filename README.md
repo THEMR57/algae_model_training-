@@ -23,6 +23,7 @@ python train_hab_model.py \
   --epochs 25 \
   --batch-size 256 \
   --seq-len 24 \
+  --threshold-objective accuracy \
   --hgb-max-iter 300 \
   --hgb-max-depth 8 \
   --hgb-learning-rate 0.05
@@ -44,6 +45,7 @@ Graphs written for research reporting:
 - `artifacts/precision_recall_curve.png`
 - `artifacts/confusion_matrix.png`
 - `artifacts/probability_distribution.png`
+- `artifacts/model_performance_comparison.png` (Accuracy/F1/Balanced Accuracy across candidate models)
 
 ## Performance matrix metrics
 
@@ -54,4 +56,4 @@ The performance matrix includes multiple metrics for each candidate model:
 - MCC, Cohen’s Kappa, Brier Score
 - Confusion matrix counts (TP, TN, FP, FN)
 
-The final selected model is the one with best validation F1 (after threshold tuning), intended to improve practical classification performance versus a single-model baseline.
+By default, threshold tuning and final model selection optimize validation **accuracy** (`--threshold-objective accuracy`) to prioritize better classification accuracy. You can switch to `f1` or `balanced_accuracy` if needed.

@@ -286,11 +286,17 @@ def compute_metrics_from_probs(y_true: np.ndarray, probs: np.ndarray, threshold:
     }
 
 
-def find_best_threshold(y_true: np.ndarray, probs: np.ndarray) -> Tuple[float, float]:
+def find_best_threshold(y_true: np.ndarray, probs: np.ndarray, objective: str = "f1") -> Tuple[float, float]:
+    if objective not in {"f1", "accuracy", "balanced_accuracy"}:
+        raise ValueError(f"Unsupported threshold objective: {objective}")
     best_threshold = 0.5
     best_f1 = -1.0
     for threshold in np.linspace(0.05, 0.95, 181):
-        score = f1_score(y_true, (probs >= threshold).astype(int), zero_division=0)
+        if objective == "f1":
+            score = f1_score(y_true, (probs >= threshold).astype(int), zero_division=0)
+        else:
+            metrics = compute_metrics_from_probs(y_true, probs, float(threshold))
+            score = float(metrics[objective])
         if score > best_f1:
             best_f1 = float(score)
             best_threshold = float(threshold)
@@ -335,13 +341,14 @@ def optimize_ensemble(
     y_val: np.ndarray,
     deep_val_probs: np.ndarray,
     tree_val_probs: np.ndarray,
+    objective: str = "f1",
 ) -> Tuple[float, float, float]:
     best_weight = 0.5
     best_threshold = 0.5
     best_f1 = -1.0
     for weight in np.linspace(0.0, 1.0, 41):
         probs = weight * deep_val_probs + (1.0 - weight) * tree_val_probs
-        threshold, f1 = find_best_threshold(y_val, probs)
+        threshold, f1 = find_best_threshold(y_val, probs, objective=objective)
         if f1 > best_f1:
             best_f1 = f1
             best_weight = float(weight)
@@ -433,6 +440,30 @@ def save_probability_distribution(y_true: np.ndarray, probs: np.ndarray, output_
     plt.close(fig)
 
 
+def save_model_performance_graph(model_records: List[Dict[str, float]], output_dir: str) -> None:
+    if not model_records:
+        return
+    labels = [str(r.get("model", "unknown")) for r in model_records]
+    accuracy = [float(r.get("accuracy", 0.0)) for r in model_records]
+    f1 = [float(r.get("f1", 0.0)) for r in model_records]
+    balanced = [float(r.get("balanced_accuracy", 0.0)) for r in model_records]
+    x = np.arange(len(labels))
+    width = 0.25
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+    ax.bar(x - width, accuracy, width=width, label="Accuracy")
+    ax.bar(x, f1, width=width, label="F1")
+    ax.bar(x + width, balanced, width=width, label="Balanced Accuracy")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=20, ha="right")
+    ax.set_ylim(0.0, 1.0)
+    ax.set_ylabel("Score")
+    ax.set_title("Model Performance Comparison")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(os.path.join(output_dir, "model_performance_comparison.png"), dpi=180)
+    plt.close(fig)
+
+
 def run_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -489,6 +520,13 @@ def main() -> None:
     parser.add_argument("--hgb-max-iter", type=int, default=300)
     parser.add_argument("--hgb-max-depth", type=int, default=8)
     parser.add_argument("--hgb-learning-rate", type=float, default=0.05)
+    parser.add_argument(
+        "--threshold-objective",
+        type=str,
+        default="accuracy",
+        choices=["f1", "accuracy", "balanced_accuracy"],
+        help="Metric to optimize while tuning thresholds and selecting the final model.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
     # Jupyter/Colab kernels inject `-f <connection_file>`; accept it silently.
@@ -604,9 +642,20 @@ def main() -> None:
     val_tab_probs = tab_model.predict_proba(val_tab_x)[:, 1]
     test_tab_probs = tab_model.predict_proba(test_tab_x)[:, 1]
 
-    deep_threshold, deep_val_f1 = find_best_threshold(val_deep_labels, val_deep_probs)
-    tab_threshold, tab_val_f1 = find_best_threshold(val_tab_y, val_tab_probs)
-    ensemble_weight, ensemble_threshold, ensemble_val_f1 = optimize_ensemble(val_tab_y, val_deep_probs, val_tab_probs)
+    deep_threshold, deep_val_score = find_best_threshold(
+        val_deep_labels, val_deep_probs, objective=args.threshold_objective
+    )
+    tab_threshold, tab_val_score = find_best_threshold(
+        val_tab_y, val_tab_probs, objective=args.threshold_objective
+    )
+    ensemble_weight, ensemble_threshold, ensemble_val_score = optimize_ensemble(
+        val_tab_y, val_deep_probs, val_tab_probs, objective=args.threshold_objective
+    )
+
+    deep_val_metrics = compute_metrics_from_probs(val_deep_labels, val_deep_probs, deep_threshold)
+    tab_val_metrics = compute_metrics_from_probs(val_tab_y, val_tab_probs, tab_threshold)
+    ensemble_val_probs = ensemble_weight * val_deep_probs + (1.0 - ensemble_weight) * val_tab_probs
+    ensemble_val_metrics = compute_metrics_from_probs(val_tab_y, ensemble_val_probs, ensemble_threshold)
 
     deep_test_metrics = compute_metrics_from_probs(test_deep_labels, test_deep_probs, deep_threshold)
     tab_test_metrics = compute_metrics_from_probs(test_tab_y, test_tab_probs, tab_threshold)
@@ -616,17 +665,29 @@ def main() -> None:
     model_records = [
         {
             "model": "stgnn_transformer",
-            "val_best_f1": deep_val_f1,
+            "val_threshold_score": deep_val_score,
+            "val_threshold_objective": args.threshold_objective,
+            "val_accuracy": deep_val_metrics["accuracy"],
+            "val_f1": deep_val_metrics["f1"],
+            "val_balanced_accuracy": deep_val_metrics["balanced_accuracy"],
             **deep_test_metrics,
         },
         {
             "model": "hist_gradient_boosting",
-            "val_best_f1": tab_val_f1,
+            "val_threshold_score": tab_val_score,
+            "val_threshold_objective": args.threshold_objective,
+            "val_accuracy": tab_val_metrics["accuracy"],
+            "val_f1": tab_val_metrics["f1"],
+            "val_balanced_accuracy": tab_val_metrics["balanced_accuracy"],
             **tab_test_metrics,
         },
         {
             "model": "hybrid_ensemble",
-            "val_best_f1": ensemble_val_f1,
+            "val_threshold_score": ensemble_val_score,
+            "val_threshold_objective": args.threshold_objective,
+            "val_accuracy": ensemble_val_metrics["accuracy"],
+            "val_f1": ensemble_val_metrics["f1"],
+            "val_balanced_accuracy": ensemble_val_metrics["balanced_accuracy"],
             "ensemble_weight_deep": ensemble_weight,
             "ensemble_weight_tabular": 1.0 - ensemble_weight,
             **ensemble_test_metrics,
@@ -635,15 +696,15 @@ def main() -> None:
 
     selected = max(
         [
-            ("stgnn_transformer", deep_val_f1, test_deep_probs, deep_threshold, deep_test_metrics),
-            ("hist_gradient_boosting", tab_val_f1, test_tab_probs, tab_threshold, tab_test_metrics),
-            ("hybrid_ensemble", ensemble_val_f1, ensemble_test_probs, ensemble_threshold, ensemble_test_metrics),
+            ("stgnn_transformer", deep_val_score, test_deep_probs, deep_threshold, deep_test_metrics),
+            ("hist_gradient_boosting", tab_val_score, test_tab_probs, tab_threshold, tab_test_metrics),
+            ("hybrid_ensemble", ensemble_val_score, ensemble_test_probs, ensemble_threshold, ensemble_test_metrics),
         ],
         key=lambda item: item[1],
     )
-    selected_name, selected_val_f1, selected_probs, selected_threshold, selected_metrics = selected
+    selected_name, selected_val_score, selected_probs, selected_threshold, selected_metrics = selected
     print(
-        f"selected_model={selected_name} selected_val_f1={selected_val_f1:.4f} "
+        f"selected_model={selected_name} selected_val_{args.threshold_objective}={selected_val_score:.4f} "
         f"test_accuracy={selected_metrics['accuracy']:.4f} test_f1={selected_metrics['f1']:.4f}"
     )
 
@@ -654,7 +715,8 @@ def main() -> None:
         json.dump(
             {
                 "selected_model": selected_name,
-                "selected_model_val_f1": selected_val_f1,
+                "selected_model_val_threshold_score": selected_val_score,
+                "selected_model_threshold_objective": args.threshold_objective,
                 "selected_threshold": selected_threshold,
                 "selected_metrics": selected_metrics,
                 "ensemble_weight_deep": ensemble_weight,
@@ -668,6 +730,7 @@ def main() -> None:
     save_roc_pr_curves(test_tab_y, selected_probs, args.output_dir)
     save_confusion_matrix_plot(test_tab_y, selected_probs, selected_threshold, args.output_dir)
     save_probability_distribution(test_tab_y, selected_probs, args.output_dir)
+    save_model_performance_graph(model_records, args.output_dir)
 
     checkpoint_path = os.path.join(args.output_dir, "stgnn_transformer_hab.pt")
     torch.save(
@@ -683,6 +746,8 @@ def main() -> None:
             "model_comparison": model_records,
             "selected_model": selected_name,
             "selected_metrics": selected_metrics,
+            "selected_val_threshold_score": selected_val_score,
+            "selected_threshold_objective": args.threshold_objective,
             "selected_threshold": selected_threshold,
             "ensemble_weight_deep": ensemble_weight,
             "ensemble_weight_tabular": 1.0 - ensemble_weight,
