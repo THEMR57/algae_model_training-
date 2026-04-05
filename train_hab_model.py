@@ -6,11 +6,26 @@ import random
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
+import matplotlib
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.metrics import (
+    average_precision_score,
+    cohen_kappa_score,
+    confusion_matrix,
+    f1_score,
+    matthews_corrcoef,
+    precision_recall_curve,
+    roc_curve,
+    roc_auc_score,
+)
 from torch.utils.data import DataLoader, Dataset
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 NODE_EMBED_INIT_STD = 0.02
 CONSTANT_FEATURE_STD_THRESHOLD = 1e-12
@@ -134,8 +149,9 @@ def build_feature_adjacency(train_x: np.ndarray, top_k: int, max_rows: int = 500
     adj = np.maximum(adj, adj.T)
     adj += np.eye(n, dtype=np.float64)
     deg = adj.sum(axis=1)
-    inv_sqrt = np.power(deg, -0.5, where=deg > 0)
-    inv_sqrt[deg <= 0] = 0.0
+    # Use explicit `out` buffer to avoid uninitialized values from masked power op.
+    inv_sqrt = np.zeros_like(deg)
+    np.power(deg, -0.5, where=deg > 0, out=inv_sqrt)
     norm = (inv_sqrt[:, None] * adj) * inv_sqrt[None, :]
     return torch.tensor(norm, dtype=torch.float32)
 
@@ -230,6 +246,193 @@ def binary_metrics(logits: torch.Tensor, labels: torch.Tensor) -> Dict[str, floa
     }
 
 
+def compute_metrics_from_probs(y_true: np.ndarray, probs: np.ndarray, threshold: float) -> Dict[str, float]:
+    preds = (probs >= threshold).astype(int)
+    tn, fp, fn, tp = confusion_matrix(y_true, preds, labels=[0, 1]).ravel()
+    precision = tp / max(tp + fp, 1)
+    recall = tp / max(tp + fn, 1)
+    specificity = tn / max(tn + fp, 1)
+    f1 = 2 * precision * recall / max(precision + recall, 1e-8)
+    accuracy = (tp + tn) / max(tp + tn + fp + fn, 1)
+    balanced_accuracy = 0.5 * (recall + specificity)
+    try:
+        roc_auc = float(roc_auc_score(y_true, probs))
+    except ValueError:
+        roc_auc = float("nan")
+    try:
+        pr_auc = float(average_precision_score(y_true, probs))
+    except ValueError:
+        pr_auc = float("nan")
+    mcc = float(matthews_corrcoef(y_true, preds)) if len(np.unique(y_true)) > 1 else 0.0
+    kappa = float(cohen_kappa_score(y_true, preds)) if len(np.unique(y_true)) > 1 else 0.0
+    brier = float(np.mean((probs - y_true) ** 2))
+    return {
+        "threshold": float(threshold),
+        "accuracy": float(accuracy),
+        "precision": float(precision),
+        "recall": float(recall),
+        "specificity": float(specificity),
+        "f1": float(f1),
+        "balanced_accuracy": float(balanced_accuracy),
+        "roc_auc": roc_auc,
+        "pr_auc": pr_auc,
+        "mcc": mcc,
+        "kappa": kappa,
+        "brier_score": brier,
+        "tp": int(tp),
+        "tn": int(tn),
+        "fp": int(fp),
+        "fn": int(fn),
+    }
+
+
+def find_best_threshold(y_true: np.ndarray, probs: np.ndarray) -> Tuple[float, float]:
+    best_threshold = 0.5
+    best_f1 = -1.0
+    for threshold in np.linspace(0.05, 0.95, 181):
+        score = f1_score(y_true, (probs >= threshold).astype(int), zero_division=0)
+        if score > best_f1:
+            best_f1 = float(score)
+            best_threshold = float(threshold)
+    return best_threshold, best_f1
+
+
+def collect_probs_labels(
+    model: nn.Module, loader: DataLoader, adj: torch.Tensor, device: torch.device
+) -> Tuple[np.ndarray, np.ndarray]:
+    model.eval()
+    probs_all: List[np.ndarray] = []
+    labels_all: List[np.ndarray] = []
+    with torch.no_grad():
+        for x, y in loader:
+            x = x.to(device)
+            logits = model(x, adj)
+            probs = torch.sigmoid(logits).cpu().numpy()
+            probs_all.append(probs)
+            labels_all.append(y.numpy().astype(int))
+    return np.concatenate(probs_all), np.concatenate(labels_all)
+
+
+def build_engineered_sequence_features(features: np.ndarray, labels: np.ndarray, seq_len: int) -> Tuple[np.ndarray, np.ndarray]:
+    if len(features) <= seq_len:
+        raise ValueError("Dataset too small for engineered sequence features.")
+    # Match SequenceDataset alignment: input window [i : i+seq_len) predicts label at i+seq_len.
+    windows = np.lib.stride_tricks.sliding_window_view(features[:-1], window_shape=seq_len, axis=0)
+    windows = np.swapaxes(windows, 1, 2)
+    mean_feat = windows.mean(axis=1)
+    std_feat = windows.std(axis=1)
+    min_feat = windows.min(axis=1)
+    max_feat = windows.max(axis=1)
+    last_feat = windows[:, -1, :]
+    engineered = np.concatenate([mean_feat, std_feat, min_feat, max_feat, last_feat], axis=1).astype(np.float32)
+    seq_labels = labels[seq_len:].astype(int)
+    if len(engineered) != len(seq_labels):
+        raise ValueError("Engineered sequence feature length mismatch.")
+    return engineered, seq_labels
+
+
+def optimize_ensemble(
+    y_val: np.ndarray,
+    deep_val_probs: np.ndarray,
+    tree_val_probs: np.ndarray,
+) -> Tuple[float, float, float]:
+    best_weight = 0.5
+    best_threshold = 0.5
+    best_f1 = -1.0
+    for weight in np.linspace(0.0, 1.0, 41):
+        probs = weight * deep_val_probs + (1.0 - weight) * tree_val_probs
+        threshold, f1 = find_best_threshold(y_val, probs)
+        if f1 > best_f1:
+            best_f1 = f1
+            best_weight = float(weight)
+            best_threshold = float(threshold)
+    return best_weight, best_threshold, best_f1
+
+
+def save_training_curves(history: List[Dict[str, float]], output_dir: str) -> None:
+    if not history:
+        return
+    epochs = [h["epoch"] for h in history]
+    train_loss = [h["train_loss"] for h in history]
+    val_loss = [h["val_loss"] for h in history]
+    train_f1 = [h["train_f1"] for h in history]
+    val_f1 = [h["val_f1"] for h in history]
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    axes[0].plot(epochs, train_loss, label="Train Loss")
+    axes[0].plot(epochs, val_loss, label="Val Loss")
+    axes[0].set_xlabel("Epoch")
+    axes[0].set_ylabel("Loss")
+    axes[0].set_title("Loss Curve")
+    axes[0].legend()
+    axes[1].plot(epochs, train_f1, label="Train F1")
+    axes[1].plot(epochs, val_f1, label="Val F1")
+    axes[1].set_xlabel("Epoch")
+    axes[1].set_ylabel("F1")
+    axes[1].set_title("F1 Curve")
+    axes[1].legend()
+    fig.tight_layout()
+    fig.savefig(os.path.join(output_dir, "training_curves.png"), dpi=180)
+    plt.close(fig)
+
+
+def save_roc_pr_curves(y_true: np.ndarray, probs: np.ndarray, output_dir: str) -> None:
+    if len(np.unique(y_true)) < 2:
+        return
+    fpr, tpr, _ = roc_curve(y_true, probs)
+    precision, recall, _ = precision_recall_curve(y_true, probs)
+    fig1 = plt.figure(figsize=(5, 5))
+    plt.plot(fpr, tpr, label="ROC")
+    plt.plot([0, 1], [0, 1], linestyle="--", color="gray")
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title("ROC Curve")
+    plt.legend()
+    plt.tight_layout()
+    fig1.savefig(os.path.join(output_dir, "roc_curve.png"), dpi=180)
+    plt.close(fig1)
+    fig2 = plt.figure(figsize=(5, 5))
+    plt.plot(recall, precision, label="PR")
+    plt.xlabel("Recall")
+    plt.ylabel("Precision")
+    plt.title("Precision-Recall Curve")
+    plt.legend()
+    plt.tight_layout()
+    fig2.savefig(os.path.join(output_dir, "precision_recall_curve.png"), dpi=180)
+    plt.close(fig2)
+
+
+def save_confusion_matrix_plot(y_true: np.ndarray, probs: np.ndarray, threshold: float, output_dir: str) -> None:
+    preds = (probs >= threshold).astype(int)
+    cm = confusion_matrix(y_true, preds, labels=[0, 1])
+    fig, ax = plt.subplots(figsize=(5, 4))
+    im = ax.imshow(cm, interpolation="nearest", cmap=plt.cm.Blues)
+    ax.figure.colorbar(im, ax=ax)
+    ax.set(xticks=[0, 1], yticks=[0, 1], xticklabels=["Pred 0", "Pred 1"], yticklabels=["True 0", "True 1"])
+    ax.set_ylabel("True label")
+    ax.set_xlabel("Predicted label")
+    ax.set_title("Confusion Matrix")
+    thresh = cm.max() / 2 if cm.max() > 0 else 0
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            ax.text(j, i, format(cm[i, j], "d"), ha="center", va="center", color="white" if cm[i, j] > thresh else "black")
+    fig.tight_layout()
+    fig.savefig(os.path.join(output_dir, "confusion_matrix.png"), dpi=180)
+    plt.close(fig)
+
+
+def save_probability_distribution(y_true: np.ndarray, probs: np.ndarray, output_dir: str) -> None:
+    fig = plt.figure(figsize=(6, 4))
+    plt.hist(probs[y_true == 0], bins=40, alpha=0.6, label="Negative Class")
+    plt.hist(probs[y_true == 1], bins=40, alpha=0.6, label="Positive Class")
+    plt.xlabel("Predicted Probability")
+    plt.ylabel("Count")
+    plt.title("Predicted Probability Distribution")
+    plt.legend()
+    plt.tight_layout()
+    fig.savefig(os.path.join(output_dir, "probability_distribution.png"), dpi=180)
+    plt.close(fig)
+
+
 def run_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -283,6 +486,9 @@ def main() -> None:
     parser.add_argument("--train-ratio", type=float, default=0.7)
     parser.add_argument("--val-ratio", type=float, default=0.15)
     parser.add_argument("--top-k-neighbors", type=int, default=4)
+    parser.add_argument("--hgb-max-iter", type=int, default=300)
+    parser.add_argument("--hgb-max-depth", type=int, default=8)
+    parser.add_argument("--hgb-learning-rate", type=float, default=0.05)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
     # Jupyter/Colab kernels inject `-f <connection_file>`; accept it silently.
@@ -298,7 +504,7 @@ def main() -> None:
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    df = pd.read_csv(args.data_path)
+    df = pd.read_csv(args.data_path, low_memory=False)
     df = clean_dataframe(df)
     if "system:index" in df.columns:
         df = df.sort_values("system:index").reset_index(drop=True)
@@ -369,12 +575,99 @@ def main() -> None:
     if best_state is not None:
         model.load_state_dict(best_state["model"])
 
-    test_m = run_epoch(model, test_loader, adj, criterion, optimizer, device, train=False)
-    print(
-        "test_metrics "
-        f"loss={test_m.loss:.4f} accuracy={test_m.accuracy:.4f} "
-        f"precision={test_m.precision:.4f} recall={test_m.recall:.4f} f1={test_m.f1:.4f}"
+    # Deep model probabilities
+    val_deep_probs, val_deep_labels = collect_probs_labels(model, val_loader, adj, device)
+    test_deep_probs, test_deep_labels = collect_probs_labels(model, test_loader, adj, device)
+
+    # Sequence-engineered tabular model
+    train_tab_x, train_tab_y = build_engineered_sequence_features(x_train, y_train, args.seq_len)
+    val_tab_x, val_tab_y = build_engineered_sequence_features(x_val, y_val, args.seq_len)
+    test_tab_x, test_tab_y = build_engineered_sequence_features(x_test, y_test, args.seq_len)
+    if not (np.array_equal(val_deep_labels, val_tab_y) and np.array_equal(test_deep_labels, test_tab_y)):
+        raise ValueError(
+            "Label alignment mismatch between deep and tabular sequence pipelines. "
+            f"Val: {len(val_deep_labels)} vs {len(val_tab_y)}, "
+            f"Test: {len(test_deep_labels)} vs {len(test_tab_y)}."
+        )
+
+    tab_model = HistGradientBoostingClassifier(
+        learning_rate=args.hgb_learning_rate,
+        max_depth=args.hgb_max_depth,
+        max_iter=args.hgb_max_iter,
+        min_samples_leaf=32,
+        l2_regularization=1e-3,
+        validation_fraction=0.1,
+        early_stopping=True,
+        random_state=args.seed,
     )
+    tab_model.fit(train_tab_x, train_tab_y)
+    val_tab_probs = tab_model.predict_proba(val_tab_x)[:, 1]
+    test_tab_probs = tab_model.predict_proba(test_tab_x)[:, 1]
+
+    deep_threshold, deep_val_f1 = find_best_threshold(val_deep_labels, val_deep_probs)
+    tab_threshold, tab_val_f1 = find_best_threshold(val_tab_y, val_tab_probs)
+    ensemble_weight, ensemble_threshold, ensemble_val_f1 = optimize_ensemble(val_tab_y, val_deep_probs, val_tab_probs)
+
+    deep_test_metrics = compute_metrics_from_probs(test_deep_labels, test_deep_probs, deep_threshold)
+    tab_test_metrics = compute_metrics_from_probs(test_tab_y, test_tab_probs, tab_threshold)
+    ensemble_test_probs = ensemble_weight * test_deep_probs + (1.0 - ensemble_weight) * test_tab_probs
+    ensemble_test_metrics = compute_metrics_from_probs(test_tab_y, ensemble_test_probs, ensemble_threshold)
+
+    model_records = [
+        {
+            "model": "stgnn_transformer",
+            "val_best_f1": deep_val_f1,
+            **deep_test_metrics,
+        },
+        {
+            "model": "hist_gradient_boosting",
+            "val_best_f1": tab_val_f1,
+            **tab_test_metrics,
+        },
+        {
+            "model": "hybrid_ensemble",
+            "val_best_f1": ensemble_val_f1,
+            "ensemble_weight_deep": ensemble_weight,
+            "ensemble_weight_tabular": 1.0 - ensemble_weight,
+            **ensemble_test_metrics,
+        },
+    ]
+
+    selected = max(
+        [
+            ("stgnn_transformer", deep_val_f1, test_deep_probs, deep_threshold, deep_test_metrics),
+            ("hist_gradient_boosting", tab_val_f1, test_tab_probs, tab_threshold, tab_test_metrics),
+            ("hybrid_ensemble", ensemble_val_f1, ensemble_test_probs, ensemble_threshold, ensemble_test_metrics),
+        ],
+        key=lambda item: item[1],
+    )
+    selected_name, selected_val_f1, selected_probs, selected_threshold, selected_metrics = selected
+    print(
+        f"selected_model={selected_name} selected_val_f1={selected_val_f1:.4f} "
+        f"test_accuracy={selected_metrics['accuracy']:.4f} test_f1={selected_metrics['f1']:.4f}"
+    )
+
+    pd.DataFrame(model_records).to_csv(os.path.join(args.output_dir, "performance_metrics_matrix.csv"), index=False)
+    with open(os.path.join(args.output_dir, "performance_metrics_matrix.json"), "w", encoding="utf-8") as f:
+        json.dump(model_records, f, indent=2)
+    with open(os.path.join(args.output_dir, "best_model_summary.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "selected_model": selected_name,
+                "selected_model_val_f1": selected_val_f1,
+                "selected_threshold": selected_threshold,
+                "selected_metrics": selected_metrics,
+                "ensemble_weight_deep": ensemble_weight,
+                "ensemble_weight_tabular": 1.0 - ensemble_weight,
+            },
+            f,
+            indent=2,
+        )
+
+    save_training_curves(history, args.output_dir)
+    save_roc_pr_curves(test_tab_y, selected_probs, args.output_dir)
+    save_confusion_matrix_plot(test_tab_y, selected_probs, selected_threshold, args.output_dir)
+    save_probability_distribution(test_tab_y, selected_probs, args.output_dir)
 
     checkpoint_path = os.path.join(args.output_dir, "stgnn_transformer_hab.pt")
     torch.save(
@@ -387,7 +680,12 @@ def main() -> None:
             "config": vars(args),
             "target_definition": target_origin,
             "best_val_f1": best_f1,
-            "test_metrics": test_m.__dict__,
+            "model_comparison": model_records,
+            "selected_model": selected_name,
+            "selected_metrics": selected_metrics,
+            "selected_threshold": selected_threshold,
+            "ensemble_weight_deep": ensemble_weight,
+            "ensemble_weight_tabular": 1.0 - ensemble_weight,
         },
         checkpoint_path,
     )
