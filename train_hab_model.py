@@ -149,6 +149,7 @@ def build_feature_adjacency(train_x: np.ndarray, top_k: int, max_rows: int = 500
     adj = np.maximum(adj, adj.T)
     adj += np.eye(n, dtype=np.float64)
     deg = adj.sum(axis=1)
+    # Use explicit `out` buffer to avoid uninitialized values from masked power op.
     inv_sqrt = np.zeros_like(deg)
     np.power(deg, -0.5, where=deg > 0, out=inv_sqrt)
     norm = (inv_sqrt[:, None] * adj) * inv_sqrt[None, :]
@@ -583,7 +584,11 @@ def main() -> None:
     val_tab_x, val_tab_y = build_engineered_sequence_features(x_val, y_val, args.seq_len)
     test_tab_x, test_tab_y = build_engineered_sequence_features(x_test, y_test, args.seq_len)
     if not (np.array_equal(val_deep_labels, val_tab_y) and np.array_equal(test_deep_labels, test_tab_y)):
-        raise ValueError("Label alignment mismatch between deep and tabular sequence pipelines.")
+        raise ValueError(
+            "Label alignment mismatch between deep and tabular sequence pipelines. "
+            f"Val: {len(val_deep_labels)} vs {len(val_tab_y)}, "
+            f"Test: {len(test_deep_labels)} vs {len(test_tab_y)}."
+        )
 
     tab_model = HistGradientBoostingClassifier(
         learning_rate=args.hgb_learning_rate,
