@@ -13,6 +13,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
 NODE_EMBED_INIT_STD = 0.02
+CONSTANT_FEATURE_STD_THRESHOLD = 1e-12
 
 
 def set_seed(seed: int) -> None:
@@ -115,11 +116,17 @@ def build_feature_adjacency(train_x: np.ndarray, top_k: int, max_rows: int = 500
         sample_x = train_x[sample_idx]
     else:
         sample_x = train_x
-    corr = np.corrcoef(sample_x, rowvar=False)
-    corr = np.nan_to_num(corr, nan=0.0)
+    n = sample_x.shape[1]
+    corr = np.zeros((n, n), dtype=np.float64)
+    non_constant = sample_x.std(axis=0) > CONSTANT_FEATURE_STD_THRESHOLD
+    non_constant_idx = np.flatnonzero(non_constant)
+    # Need at least two non-constant features to estimate pairwise correlation.
+    if non_constant_idx.size >= 2:
+        corr_non_constant = np.corrcoef(sample_x[:, non_constant_idx], rowvar=False)
+        # Keep as numeric safety fallback for pathological finite-precision cases.
+        corr[np.ix_(non_constant_idx, non_constant_idx)] = np.nan_to_num(corr_non_constant, nan=0.0)
     corr = np.abs(corr)
     np.fill_diagonal(corr, 0.0)
-    n = corr.shape[0]
     adj = np.zeros_like(corr)
     for i in range(n):
         idx = np.argsort(corr[i])[-top_k:]
